@@ -1,0 +1,372 @@
+"""
+LAYER 1: VIRTUAL ENVIRONMENT & TARGET GENERATOR
+PS 26169 (ISRO) - AI-Based Virtual Camera Tracking System for FSOC Terminals
+
+Implements every Layer-1-relevant parameter from the official problem
+statement's "Target Parameters" table:
+    - Screen size: 2000x2000 px (min.), user-defined
+    - Target type: beacon spot
+    - Number of targets: 1 mandatory, multiple optional  -> supported
+    - Target shape: user-defined, default Square         -> supported
+    - Target size: 5-20 x 5-20 px (user-defined), default 10x10 -> supported
+    - Initial target location: user-defined, default Random      -> supported
+    - Motion: Straight Line, Circular, Figure of 8, Random (mandatory,
+      at least 4) + Spiral, Sinusoidal (optional)                -> supported
+
+Outputs, per generation run:
+    - An .mp4 video (feeds Layer 2 exactly the way real ISRO video will)
+    - A .csv of per-frame, per-target ground truth: frame_idx, timestamp_sec,
+      target_id, true_x, true_y  (used by Layer 6 to compute tracking RMSE)
+
+Usage examples:
+    python3 layer1_target_generator.py --trajectory circular --duration 10
+    python3 layer1_target_generator.py --num-targets 3 --trajectory random \
+        --shape circle --target-size 15
+    python3 layer1_target_generator.py --trajectories circular,spiral,figure8 \
+        --duration 8 --seed 42
+"""
+
+import argparse
+import csv
+import math
+import os
+import random
+
+import cv2
+import numpy as np
+
+# ----------------------------------------------------------------------------
+# CONFIG DEFAULTS (match these across Layer 2/3/4 so nothing breaks downstream)
+# ----------------------------------------------------------------------------
+CANVAS_SIZE = 2000          # pixels, square canvas (PS: 2000x2000 min.)
+TARGET_SIZE_DEFAULT = 10    # pixels (PS default: 10x10)
+TARGET_SIZE_MIN = 5         # pixels (PS range: 5-20)
+TARGET_SIZE_MAX = 20
+BACKGROUND_COLOR = (10, 10, 10)      # near-black "space" background (BGR)
+TARGET_COLOR = (255, 255, 255)       # bright beacon (BGR, since OpenCV)
+DEFAULT_FPS = 30
+DEFAULT_DURATION_SEC = 10
+EDGE_MARGIN = 60             # keeps targets from spawning/moving off-canvas
+
+# All mandatory + optional trajectory names, in a fixed order used when
+# auto-assigning distinct trajectories across multiple targets.
+TRAJECTORY_ORDER = [
+    "circular", "straight_line", "figure8", "random_walk", "spiral", "sinusoidal",
+]
+
+
+# ----------------------------------------------------------------------------
+# TRAJECTORIES
+# Each is a small stateful class with get_position(t) -> (x, y) in canvas
+# coordinates. Using classes (rather than the module-level globals from the
+# first version) means each target gets its own independent state -- required
+# now that multiple targets can exist at once, each on its own trajectory.
+# ----------------------------------------------------------------------------
+
+class Trajectory:
+    """Base class. Subclasses implement get_position(t)."""
+    def get_position(self, t):
+        raise NotImplementedError
+
+
+class StraightLine(Trajectory):
+    def __init__(self, canvas_size, rng, initial_xy=None):
+        self.canvas_size = canvas_size
+        if initial_xy is not None:
+            self.x0, self.y0 = initial_xy
+        else:
+            self.x0 = rng.uniform(EDGE_MARGIN, canvas_size - EDGE_MARGIN)
+            self.y0 = rng.uniform(EDGE_MARGIN, canvas_size - EDGE_MARGIN)
+        speed = canvas_size / 8.0
+        angle = rng.uniform(0, 2 * math.pi)
+        self.vx = speed * math.cos(angle)
+        self.vy = speed * math.sin(angle)
+
+    def get_position(self, t):
+        x = _bounce(self.x0 + self.vx * t, self.canvas_size)
+        y = _bounce(self.y0 + self.vy * t, self.canvas_size)
+        return x, y
+
+
+class Circular(Trajectory):
+    def __init__(self, canvas_size, rng, initial_xy=None):
+        self.cx, self.cy = canvas_size / 2, canvas_size / 2
+        self.r = canvas_size * rng.uniform(0.2, 0.35)
+        self.omega = rng.uniform(0.3, 0.7)
+        # "initial location" for a circular path = starting phase angle
+        self.phase = rng.uniform(0, 2 * math.pi) if initial_xy is None else \
+            math.atan2(initial_xy[1] - self.cy, initial_xy[0] - self.cx)
+
+    def get_position(self, t):
+        x = self.cx + self.r * math.cos(self.omega * t + self.phase)
+        y = self.cy + self.r * math.sin(self.omega * t + self.phase)
+        return x, y
+
+
+class FigureEight(Trajectory):
+    def __init__(self, canvas_size, rng, initial_xy=None):
+        self.cx, self.cy = canvas_size / 2, canvas_size / 2
+        self.A = canvas_size * rng.uniform(0.25, 0.35)
+        self.B = canvas_size * rng.uniform(0.18, 0.28)
+        self.a, self.b = 1.0, 2.0
+        self.delta = rng.uniform(0, 2 * math.pi)
+
+    def get_position(self, t):
+        x = self.cx + self.A * math.sin(self.a * t + self.delta)
+        y = self.cy + self.B * math.sin(self.b * t)
+        return x, y
+
+
+class RandomWalk(Trajectory):
+    def __init__(self, canvas_size, rng, initial_xy=None, step_std=8.0):
+        self.canvas_size = canvas_size
+        self.rng = rng
+        self.step_std = step_std
+        if initial_xy is not None:
+            self.x, self.y = initial_xy
+        else:
+            self.x = rng.uniform(EDGE_MARGIN, canvas_size - EDGE_MARGIN)
+            self.y = rng.uniform(EDGE_MARGIN, canvas_size - EDGE_MARGIN)
+        self._last_t = 0.0
+
+    def get_position(self, t):
+        # Step size scales with elapsed time since last call so behaviour
+        # stays consistent regardless of fps.
+        dt = max(t - self._last_t, 1e-6)
+        self._last_t = t
+        self.x += self.rng.gauss(0, self.step_std) * math.sqrt(dt * 30)
+        self.y += self.rng.gauss(0, self.step_std) * math.sqrt(dt * 30)
+        self.x = _bounce(self.x, self.canvas_size)
+        self.y = _bounce(self.y, self.canvas_size)
+        return self.x, self.y
+
+
+class Spiral(Trajectory):
+    """Optional trajectory (PS lists Spiral as an optional motion type)."""
+    def __init__(self, canvas_size, rng, initial_xy=None):
+        self.cx, self.cy = canvas_size / 2, canvas_size / 2
+        self.r0 = canvas_size * 0.03
+        self.max_r = canvas_size / 2 - EDGE_MARGIN
+        self.growth = canvas_size * rng.uniform(0.015, 0.03)  # px per second
+        self.omega = rng.uniform(0.8, 1.4)
+        self.phase = rng.uniform(0, 2 * math.pi)
+
+    def get_position(self, t):
+        # Radius grows then wraps back, so the spiral doesn't run off-canvas
+        # and stays useful for arbitrary --duration values.
+        r = self.r0 + (self.growth * t) % self.max_r
+        x = self.cx + r * math.cos(self.omega * t + self.phase)
+        y = self.cy + r * math.sin(self.omega * t + self.phase)
+        return x, y
+
+
+class Sinusoidal(Trajectory):
+    """Optional trajectory (PS lists Sinusoidal as an optional motion type)."""
+    def __init__(self, canvas_size, rng, initial_xy=None):
+        self.canvas_size = canvas_size
+        if initial_xy is not None:
+            self.x0, self.cy = initial_xy
+        else:
+            self.x0 = EDGE_MARGIN
+            self.cy = rng.uniform(EDGE_MARGIN, canvas_size - EDGE_MARGIN)
+        self.vx = canvas_size / rng.uniform(6.0, 10.0)
+        self.amplitude = canvas_size * rng.uniform(0.15, 0.25)
+        self.freq = rng.uniform(0.5, 1.2)
+        self.phase = rng.uniform(0, 2 * math.pi)
+
+    def get_position(self, t):
+        x = _bounce(self.x0 + self.vx * t, self.canvas_size)
+        y = self.cy + self.amplitude * math.sin(self.freq * t + self.phase)
+        y = min(max(y, EDGE_MARGIN), self.canvas_size - EDGE_MARGIN)
+        return x, y
+
+
+TRAJECTORY_CLASSES = {
+    "straight_line": StraightLine,
+    "circular": Circular,
+    "figure8": FigureEight,
+    "random_walk": RandomWalk,
+    "spiral": Spiral,
+    "sinusoidal": Sinusoidal,
+}
+
+
+def _bounce(pos, canvas_size, margin=EDGE_MARGIN):
+    """Reflects a coordinate back into [margin, canvas_size - margin]."""
+    lo, hi = margin, canvas_size - margin
+    span = hi - lo
+    if span <= 0:
+        return canvas_size / 2
+    pos_mod = (pos - lo) % (2 * span)
+    if pos_mod > span:
+        pos_mod = 2 * span - pos_mod
+    return lo + pos_mod
+
+
+# ----------------------------------------------------------------------------
+# TARGET (shape + size + trajectory bundled together)
+# ----------------------------------------------------------------------------
+
+class Target:
+    def __init__(self, target_id, trajectory_name, canvas_size, shape, size,
+                 rng, initial_xy=None):
+        if trajectory_name not in TRAJECTORY_CLASSES:
+            raise ValueError(
+                f"Unknown trajectory '{trajectory_name}'. "
+                f"Choose from {list(TRAJECTORY_CLASSES.keys())}")
+        if not (TARGET_SIZE_MIN <= size <= TARGET_SIZE_MAX):
+            raise ValueError(
+                f"target size must be between {TARGET_SIZE_MIN} and "
+                f"{TARGET_SIZE_MAX}px (got {size})")
+        self.target_id = target_id
+        self.trajectory_name = trajectory_name
+        self.shape = shape
+        self.size = size
+        self.trajectory = TRAJECTORY_CLASSES[trajectory_name](
+            canvas_size, rng, initial_xy=initial_xy)
+
+    def position_at(self, t):
+        return self.trajectory.get_position(t)
+
+    def draw(self, frame, x, y):
+        cx, cy = int(round(x)), int(round(y))
+        half = self.size // 2
+        if self.shape == "square":
+            cv2.rectangle(frame, (cx - half, cy - half), (cx + half, cy + half),
+                          TARGET_COLOR, thickness=-1)
+        elif self.shape == "circle":
+            cv2.circle(frame, (cx, cy), half, TARGET_COLOR,
+                       thickness=-1, lineType=cv2.LINE_AA)
+        else:
+            raise ValueError(f"Unknown shape '{self.shape}'")
+
+
+# ----------------------------------------------------------------------------
+# GENERATION
+# ----------------------------------------------------------------------------
+
+def build_targets(num_targets, trajectory_names, canvas_size, shape, size,
+                   seed, initial_positions=None):
+    """
+    trajectory_names: list of trajectory name(s). If shorter than
+    num_targets, cycles through TRAJECTORY_ORDER to fill the remainder with
+    distinct trajectories (keeps multi-target scenes visually distinguishable).
+    initial_positions: optional list of (x, y) tuples, same length as
+    num_targets, for reproducible/fixed starting points. None means the PS
+    default of "Random" is used.
+    """
+    rng = random.Random(seed)
+    names = list(trajectory_names)
+    if len(names) < num_targets:
+        # Fill remaining targets with distinct trajectories where possible
+        pool = [n for n in TRAJECTORY_ORDER if n not in names] + TRAJECTORY_ORDER
+        i = 0
+        while len(names) < num_targets:
+            names.append(pool[i % len(pool)])
+            i += 1
+    names = names[:num_targets]
+
+    targets = []
+    for i in range(num_targets):
+        init_xy = initial_positions[i] if initial_positions else None
+        targets.append(Target(i, names[i], canvas_size, shape, size, rng,
+                              initial_xy=init_xy))
+    return targets
+
+
+def generate(num_targets, trajectory_names, duration_sec, fps, canvas_size,
+             shape, size, out_dir, seed=None, initial_positions=None,
+             preview=False):
+    targets = build_targets(num_targets, trajectory_names, canvas_size,
+                            shape, size, seed, initial_positions)
+    num_frames = int(duration_sec * fps)
+
+    os.makedirs(out_dir, exist_ok=True)
+    tag = "multi" if num_targets > 1 else targets[0].trajectory_name
+    video_path = os.path.join(out_dir, f"layer1_{tag}.mp4")
+    csv_path = os.path.join(out_dir, f"layer1_{tag}_ground_truth.csv")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(video_path, fourcc, fps, (canvas_size, canvas_size))
+
+    with open(csv_path, "w", newline="") as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(["frame_idx", "timestamp_sec", "target_id",
+                             "trajectory", "shape", "size_px", "true_x", "true_y"])
+
+        for i in range(num_frames):
+            t = i / fps
+            frame = np.full((canvas_size, canvas_size, 3), BACKGROUND_COLOR,
+                            dtype=np.uint8)
+            for target in targets:
+                x, y = target.position_at(t)
+                target.draw(frame, x, y)
+                csv_writer.writerow([i, f"{t:.4f}", target.target_id,
+                                     target.trajectory_name, target.shape,
+                                     target.size, f"{x:.2f}", f"{y:.2f}"])
+            writer.write(frame)
+
+            if preview and i % fps == 0:
+                positions = ", ".join(
+                    f"T{tg.target_id}({tg.position_at(t)[0]:.0f},"
+                    f"{tg.position_at(t)[1]:.0f})" for tg in targets)
+                print(f"t={t:5.1f}s  frame={i:4d}  {positions}")
+
+    writer.release()
+    print(f"\nDone. {num_frames} frames written, {num_targets} target(s): "
+          f"{[t.trajectory_name for t in targets]}")
+    print(f"  Video (feeds Layer 2 exactly like real ISRO footage): {video_path}")
+    print(f"  Ground truth (used by Layer 6 for RMSE):              {csv_path}")
+    return video_path, csv_path
+
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Layer 1: Virtual Target Generator")
+    parser.add_argument("--trajectory", choices=list(TRAJECTORY_CLASSES.keys()),
+                        default="circular",
+                        help="Motion pattern (used when --trajectories is not given)")
+    parser.add_argument("--trajectories", default=None,
+                        help="Comma-separated trajectory names, one per target, "
+                             "e.g. circular,spiral,figure8 (overrides --trajectory)")
+    parser.add_argument("--num-targets", type=int, default=1,
+                        help="Number of simultaneous targets (PS: 1 mandatory, "
+                             "multiple optional)")
+    parser.add_argument("--shape", choices=["square", "circle"], default="square",
+                        help="Target shape (PS default: square)")
+    parser.add_argument("--target-size", type=int, default=TARGET_SIZE_DEFAULT,
+                        help=f"Target size in px, {TARGET_SIZE_MIN}-{TARGET_SIZE_MAX} "
+                             f"(PS default: 10)")
+    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION_SEC,
+                        help="Duration in seconds")
+    parser.add_argument("--fps", type=int, default=DEFAULT_FPS,
+                        help="Frames per second")
+    parser.add_argument("--canvas-size", type=int, default=CANVAS_SIZE,
+                        help="Canvas resolution (square, pixels)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed, for reproducible initial positions "
+                             "(omit for true PS-default 'Random' behaviour)")
+    parser.add_argument("--out-dir", default="./layer1_output",
+                        help="Output directory for video + CSV")
+    parser.add_argument("--preview", action="store_true",
+                        help="Print target position(s) once per second while generating")
+    args = parser.parse_args()
+
+    trajectory_names = (args.trajectories.split(",") if args.trajectories
+                        else [args.trajectory])
+
+    # If --trajectories was given explicitly with more names than
+    # --num-targets specifies, infer the target count from the list rather
+    # than silently dropping the extra trajectories the user asked for.
+    num_targets = max(args.num_targets, len(trajectory_names))
+
+    generate(num_targets, trajectory_names, args.duration, args.fps,
+             args.canvas_size, args.shape, args.target_size, args.out_dir,
+             seed=args.seed, preview=args.preview)
+
+
+if __name__ == "__main__":
+    main()
